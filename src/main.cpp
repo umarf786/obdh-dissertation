@@ -73,6 +73,34 @@ static void imu_init_or_die() {
 
 static void gps_init_start() { GPSSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX); }
 
+// SLAVE STUFF
+// CRC-16-CCITT
+static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc=0xFFFF){
+  for (size_t i=0;i<len;i++){ crc ^= uint16_t(data[i])<<8; for(int b=0;b<8;b++){ crc = (crc&0x8000)? (crc<<1)^0x1021 : (crc<<1); } }
+  return crc;
+}
+
+// Link packet used by your slave
+struct __attribute__((packed)) LinkPacket { uint32_t seq; float value; uint16_t crc16; };
+
+static bool read_link_packet(uint8_t addr, LinkPacket& out){
+  I2C_MPU.beginTransmission(addr);
+  I2C_MPU.write((uint8_t)0x00);
+  if (I2C_MPU.endTransmission(false) != 0) return false;
+
+  const int want = sizeof(LinkPacket);
+  int got = I2C_MPU.requestFrom((int)addr, want, (int)true);
+  if (got != want) return false;
+
+  uint8_t buf[sizeof(LinkPacket)];
+  for (int i=0;i<want;i++) buf[i]=I2C_MPU.read();
+  memcpy(&out, buf, sizeof(out));
+
+  uint16_t c = crc16_ccitt(buf, sizeof(LinkPacket)-2);
+  return (c == out.crc16);
+}
+
+
 // --- void setup() ---
 void setup() {
   Serial.begin(115200);
@@ -111,6 +139,20 @@ void loop() {
   // IMU read
   sensors_event_t a,g,t;
   mpu.getEvent(&a,&g,&t);
+
+  // Slave
+  // Poll sensor1 @ 5 Hz over the same I2C bus as the MPU (pins 45/46)
+  static uint32_t lastSEN1=0;
+  if (millis() - lastSEN1 >= 200) {
+    LinkPacket lp{};
+    if (read_link_packet(0x20, lp)) {
+      uint32_t sec = millis()/1000;
+      uint16_t ms  = (uint16_t)(millis()%1000);
+      SENrec sr{ 0x20, lp.value };
+      logger_logSEN(sr, sec, ms);   // this goes to /sensor1 region now
+    }
+    lastSEN1 = millis();
+  }
 
   // Timestamps
   uint32_t sec = millis()/1000;
@@ -152,6 +194,8 @@ void loop() {
     else if (c=='p') logger_dump_hdrs_gps(Serial, 0);   // NEW: GPS headers + CRC
     else if (c=='X') logger_dump_hex_imu(Serial, 0);    // NEW: IMU hex
     else if (c=='x') logger_dump_hex_gps(Serial, 0);    // NEW: GPS hex
+    else if (c=='S') logger_dump_csv_sen(Serial, 0);  // Sensor1 CSV from /sensor1 region
+    
   }
 
 

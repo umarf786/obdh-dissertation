@@ -18,6 +18,7 @@ struct Region {
 
 extern Region GPS_FILE;   // 0x00000..0x10000
 extern Region ACC_FILE;   // 0x10000..0x20000
+extern Region SENS1_FILE;   // name: "/sensor1"
 
 // Initialize regions and compute write pointers by scan.
 void vfs_init(bool force_clear=false);
