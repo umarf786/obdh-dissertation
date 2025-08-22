@@ -1,43 +1,3 @@
-/*
-================================================================================
- Project: Heltec ESP32-S3 Logger (GPS + IMU + OLED) with External W25Q Storage
- Purpose: Append-only CCSDS logger to raw SPI NOR "VFS" regions (no heavy FS)
---------------------------------------------------------------------------------
- HOW TO READ THIS CODE
-  - src/main.cpp          : boots hardware, logs IMU @10 Hz + GPS @1 Hz, serial cmds
-  - include/ccsds_min.h   : tiny CCSDS packet packer (+ optional CRC-16)
-  - include/vfs_simple.h  : super-small append-only "VFS" on raw NOR (len + packet)
-  - src/vfs_simple.cpp    : scans end, writes with page-safe programming, erases on wrap
-  - include/w25q.h        : minimal W25Q SPI NOR driver API (read/write/erase/JEDEC)
-  - src/w25q.cpp          : low-level SPI ops (page split, sector erase, busy-wait)
-  - include/logger_vfs.h  : logger API (enqueue/flush, dumps)
-  - src/logger_vfs.cpp    : queues → CCSDS packetise → VFS append; CSV/hex/header dumps
-  - include/oled_ui.h     : OLED helpers; power control for Vext
-  - src/oled_ui.cpp       : renders 4-line status
-  - include/pins.h        : board pin map & HSPI instance
---------------------------------------------------------------------------------
- DESIGN IN 60 SECONDS
-  * Storage format per region:
-       [ uint16_be length ] [ CCSDS packet bytes (header+time+payload[+crc]) ] ...
-    We scan from region base at boot until we hit 0xFFFF (erased) or an invalid
-    length, and append from there. If we run out of room, we erase the region
-    (sector-wise) and start again from the base. This is robust and tiny.
-  * CCSDS:
-       Primary header (6B), 6B time SH (sec+ms), payload (IMU/GPS), optional CRC16.
-  * Concurrency:
-       Producer tasks enqueue frames; loop() periodically flushes a handful of
-       packets to flash to keep latency low without blocking sensors.
-  * Why no filesystem?
-       Mounting a general FS on ESP32-S3 external W25Q is possible but fussy.
-       This raw format is trivial, fail-safe, and easy to stream/parse.
---------------------------------------------------------------------------------
- SAFETY NOTES
-  - We never program across a NOR page boundary without splitting the write.
-  - Sector erase before writing a fresh (just-rolled) sector.
-  - Dumps never trust lengths blindly; we check bounds before reading.
-  - OLED Vext is enabled *before* touching external peripherals.
-================================================================================
-*/
 #include <Arduino.h>
 #include "pins.h"
 #include "w25q.h"
@@ -51,14 +11,20 @@
 #include <HardwareSerial.h>
 #include <Wire.h>
 
+// NEW: individual sensor pollers
+#include "sens_common.h"
+#include "sens1.h"
+#include "sens2.h"
+#include "sens3.h"
+
 Adafruit_MPU6050 mpu;
-TwoWire I2C_MPU(1);
+TwoWire I2C_MPU(1);        // shared I2C controller (MPU + sensors on 45/46)
 HardwareSerial GPSSerial(1);
 TinyGPSPlus gps;
 
 // --- static void imu_init_or_die() ---
 static void imu_init_or_die() {
-  I2C_MPU.begin(MPU_SDA, MPU_SCL, 50000);
+  I2C_MPU.begin(MPU_SDA, MPU_SCL, 100000);   // 100k for reliable ESP32 slave link
   delay(50);
   Serial.println("[imu] mpu.begin on I2C_MPU");
   if (!mpu.begin(0x68, &I2C_MPU)) {
@@ -73,41 +39,13 @@ static void imu_init_or_die() {
 
 static void gps_init_start() { GPSSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX); }
 
-// SLAVE STUFF
-// CRC-16-CCITT
-static uint16_t crc16_ccitt(const uint8_t* data, size_t len, uint16_t crc=0xFFFF){
-  for (size_t i=0;i<len;i++){ crc ^= uint16_t(data[i])<<8; for(int b=0;b<8;b++){ crc = (crc&0x8000)? (crc<<1)^0x1021 : (crc<<1); } }
-  return crc;
-}
-
-// Link packet used by your slave
-struct __attribute__((packed)) LinkPacket { uint32_t seq; float value; uint16_t crc16; };
-
-static bool read_link_packet(uint8_t addr, LinkPacket& out){
-  I2C_MPU.beginTransmission(addr);
-  I2C_MPU.write((uint8_t)0x00);
-  if (I2C_MPU.endTransmission(false) != 0) return false;
-
-  const int want = sizeof(LinkPacket);
-  int got = I2C_MPU.requestFrom((int)addr, want, (int)true);
-  if (got != want) return false;
-
-  uint8_t buf[sizeof(LinkPacket)];
-  for (int i=0;i<want;i++) buf[i]=I2C_MPU.read();
-  memcpy(&out, buf, sizeof(out));
-
-  uint16_t c = crc16_ccitt(buf, sizeof(LinkPacket)-2);
-  return (c == out.crc16);
-}
-
-
 // --- void setup() ---
 void setup() {
   Serial.begin(115200);
   delay(400);
-  Serial.println("\n🔧 Logger (Simple Raw VFS + CCSDS + OLED)");
+  Serial.println("\n🔧 Logger (Simple Raw VFS + CCSDS + OLED + 3x I2C sensors)");
 
-  // Power external rail first
+  // Power external rail first (OLED + W25Q)
   oled_power_on(); delay(80);
 
   // Init HSPI + flash
@@ -116,8 +54,14 @@ void setup() {
   uint32_t jedec = w25q_readJEDEC();
   Serial.printf("JEDEC: 0x%06lX\n", (unsigned long)jedec);
 
-  // Simple VFS init (scan for end)
+  // Simple VFS init (scan for end, or clear=false)
   vfs_init(false);
+  // If your vfs_init doesn't set wptrs for empty regions, force base:
+  if (GPS_FILE.wptr==0)   GPS_FILE.wptr   = GPS_FILE.base;
+  if (ACC_FILE.wptr==0)   ACC_FILE.wptr   = ACC_FILE.base;
+  if (SENS1_FILE.wptr==0) SENS1_FILE.wptr = SENS1_FILE.base;
+  if (SENS2_FILE.wptr==0) SENS2_FILE.wptr = SENS2_FILE.base;
+  if (SENS3_FILE.wptr==0) SENS3_FILE.wptr = SENS3_FILE.base;
 
   // Logger queue
   logger_begin();
@@ -128,7 +72,7 @@ void setup() {
   imu_init_or_die();
   gps_init_start();
 
-  Serial.println("✅ Ready. Keys: I dump IMU CSV, G dump GPS CSV, C clear");
+  Serial.println("✅ Ready. Keys: I(imu) G(gps) 1/2/3(sensor CSV) C(clear) P/p(headers) X/x(hex)");
 }
 
 // --- void loop() ---
@@ -140,23 +84,14 @@ void loop() {
   sensors_event_t a,g,t;
   mpu.getEvent(&a,&g,&t);
 
-  // Slave
-  // Poll sensor1 @ 5 Hz over the same I2C bus as the MPU (pins 45/46)
-  static uint32_t lastSEN1=0;
-  if (millis() - lastSEN1 >= 200) {
-    LinkPacket lp{};
-    if (read_link_packet(0x20, lp)) {
-      uint32_t sec = millis()/1000;
-      uint16_t ms  = (uint16_t)(millis()%1000);
-      SENrec sr{ 0x20, lp.value };
-      logger_logSEN(sr, sec, ms);   // this goes to /sensor1 region now
-    }
-    lastSEN1 = millis();
-  }
-
-  // Timestamps
+  // Timestamps (shared by all logs this tick)
   uint32_t sec = millis()/1000;
   uint16_t ms  = (uint16_t)(millis()%1000);
+
+  // Poll 3 separate I²C sensors on the same bus (45/46)
+  sens1_poll(sec, ms);  // addr 0x20 -> /sensor1 (APID 0x110)
+  sens2_poll(sec, ms);  // addr 0x21 -> /sensor2 (APID 0x111)
+  sens3_poll(sec, ms);  // addr 0x22 -> /sensor3 (APID 0x112)
 
   // Log IMU @10 Hz
   static uint32_t lastIMU=0;
@@ -182,22 +117,22 @@ void loop() {
   // Flush a few queued records to flash
   logger_flush_some();
 
-  // OLED update
+  // OLED update (unchanged)
   drawOLED(a,g,t,gps);
 
   if (Serial.available()) {
     char c = Serial.read();
-    if (c=='I') logger_dump_csv_imu(Serial, 0);
+    if      (c=='I') logger_dump_csv_imu(Serial, 0);
     else if (c=='G') logger_dump_csv_gps(Serial, 0);
+    else if (c=='1') logger_dump_csv_sen1(Serial, 0);  // /sensor1
+    else if (c=='2') logger_dump_csv_sen2(Serial, 0);  // /sensor2
+    else if (c=='3') logger_dump_csv_sen3(Serial, 0);  // /sensor3
     else if (c=='C') { logger_clear_all(); Serial.println("🧹 Cleared"); }
-    else if (c=='P') logger_dump_hdrs_imu(Serial, 0);   // NEW: IMU headers + CRC
-    else if (c=='p') logger_dump_hdrs_gps(Serial, 0);   // NEW: GPS headers + CRC
-    else if (c=='X') logger_dump_hex_imu(Serial, 0);    // NEW: IMU hex
-    else if (c=='x') logger_dump_hex_gps(Serial, 0);    // NEW: GPS hex
-    else if (c=='S') logger_dump_csv_sen(Serial, 0);  // Sensor1 CSV from /sensor1 region
-    
+    else if (c=='P') logger_dump_hdrs_imu(Serial, 0);
+    else if (c=='p') logger_dump_hdrs_gps(Serial, 0);
+    else if (c=='X') logger_dump_hex_imu(Serial, 0);
+    else if (c=='x') logger_dump_hex_gps(Serial, 0);
   }
-
 
   delay(5);
 }
