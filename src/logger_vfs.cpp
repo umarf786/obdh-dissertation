@@ -43,7 +43,7 @@ void logger_flush_some(){
       vfs_append_packet(GPS_FILE, pkt, (uint16_t)n);
     } else { // K_SEN
       n = ccsds_pack(pkt, 0x110, (uint8_t*)&m.u.sen, sizeof(SENrec), m.sec, m.ms, seqSEN++, /*addCRC=*/true);
-      vfs_append_packet(ACC_FILE, pkt, (uint16_t)n);
+      vfs_append_packet(SENS1_FILE, pkt, (uint16_t)n);
     }
   }
 }

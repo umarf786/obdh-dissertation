@@ -58,7 +58,7 @@ TinyGPSPlus gps;
 
 // --- static void imu_init_or_die() ---
 static void imu_init_or_die() {
-  I2C_MPU.begin(MPU_SDA, MPU_SCL, 400000);
+  I2C_MPU.begin(MPU_SDA, MPU_SCL, 50000);
   delay(50);
   Serial.println("[imu] mpu.begin on I2C_MPU");
   if (!mpu.begin(0x68, &I2C_MPU)) {
