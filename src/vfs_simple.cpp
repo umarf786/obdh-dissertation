@@ -2,6 +2,9 @@
 
 Region GPS_FILE = { "/gps",   0x00000, 0x10000, 0 };
 Region ACC_FILE = { "/accel", 0x10000, 0x20000, 0 };
+Region SENS1_FILE = { "/sensor1",0x20000, 0x30000, 0 };
+Region SENS2_FILE = { "/sensor2",0x30000, 0x40000, 0 };
+Region SENS3_FILE = { "/sensor3",0x40000, 0x50000, 0 };
 
 // scan region for end: [len_be][payload]... until erased or invalid
 // --- static uint32_t scan_end(const Region& R) ---
@@ -32,11 +35,21 @@ void vfs_init(bool force_clear){
   if (force_clear){
     erase_region(GPS_FILE);
     erase_region(ACC_FILE);
+    erase_region(SENS1_FILE);
+    erase_region(SENS2_FILE);
+    erase_region(SENS3_FILE);
+
     GPS_FILE.wptr = GPS_FILE.base;
     ACC_FILE.wptr = ACC_FILE.base;
+    SENS1_FILE.wptr = SENS1_FILE.base;
+    SENS2_FILE.wptr = SENS2_FILE.base;
+    SENS3_FILE.wptr = SENS3_FILE.base;
   } else {
     GPS_FILE.wptr = scan_end(GPS_FILE);
     ACC_FILE.wptr = scan_end(ACC_FILE);
+    SENS1_FILE.wptr = scan_end(SENS1_FILE);
+    SENS2_FILE.wptr = scan_end(SENS2_FILE);
+    SENS3_FILE.wptr = scan_end(SENS3_FILE);
   }
 }
 

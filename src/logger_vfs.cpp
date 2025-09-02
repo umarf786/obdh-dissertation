@@ -4,13 +4,36 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
-static QueueHandle_t q;
-static uint16_t seqIMU=0, seqGPS=0;
+extern "C" __attribute__((weak))
+bool link_enqueue_bin(uint16_t, const uint8_t*, uint16_t) { return false; }
 
-enum Kind : uint8_t { K_IMU=1, K_GPS=2 };
-struct Msg { Kind k; uint32_t sec; uint16_t ms; union { IMUrec imu; GPSrec gps; } u; };
+extern "C" __attribute__((weak))
+bool link_is_ready(void) { return false; }
+
+
+#define SENSOR1_APID 0x110
+#define SENSOR2_APID 0x111
+#define SENSOR3_APID 0x112
+
+static QueueHandle_t q;
+static uint16_t seqIMU=0, seqGPS=0, seqSEN1=0, seqSEN2=0, seqSEN3=0;
+
+enum Kind : uint8_t { K_IMU=1, K_GPS=2, K_SEN1=3, K_SEN2=4, K_SEN3=5 };
+struct Msg {
+  Kind k; uint32_t sec; uint16_t ms;
+  union { IMUrec imu; GPSrec gps; SENrec sen; } u;
+};
 
 void logger_begin(){ q = xQueueCreate(128, sizeof(Msg)); }
+void logger_logSEN1(const SENrec& v, uint32_t sec, uint16_t ms){
+  if (!q) return; Msg m{}; m.k=K_SEN1; m.sec=sec; m.ms=ms; m.u.sen=v; xQueueSend(q,&m,0);
+}
+void logger_logSEN2(const SENrec& v, uint32_t sec, uint16_t ms){
+  if (!q) return; Msg m{}; m.k=K_SEN2; m.sec=sec; m.ms=ms; m.u.sen=v; xQueueSend(q,&m,0);
+}
+void logger_logSEN3(const SENrec& v, uint32_t sec, uint16_t ms){
+  if (!q) return; Msg m{}; m.k=K_SEN3; m.sec=sec; m.ms=ms; m.u.sen=v; xQueueSend(q,&m,0);
+}
 
 // --- void logger_logIMU(const IMUrec& v, uint32_t sec, uint16_t ms) ---
 void logger_logIMU(const IMUrec& v, uint32_t sec, uint16_t ms){
@@ -29,20 +52,47 @@ void logger_flush_some(){
     if (xQueueReceive(q,&m,0) != pdTRUE) break;
     uint8_t pkt[200]; size_t n=0;
     if (m.k==K_IMU){
-      n = ccsds_pack(pkt, 0x101, (uint8_t*)&m.u.imu, sizeof(IMUrec), m.sec, m.ms, seqIMU++, /*addCRC=*/true);
-      vfs_append_packet(ACC_FILE, pkt, (uint16_t)n);
-    } else {
-      n = ccsds_pack(pkt, 0x100, (uint8_t*)&m.u.gps, sizeof(GPSrec), m.sec, m.ms, seqGPS++, /*addCRC=*/true);
-      vfs_append_packet(GPS_FILE, pkt, (uint16_t)n);
-    }
+  n = ccsds_pack(pkt, 0x101, (uint8_t*)&m.u.imu, sizeof(IMUrec), m.sec, m.ms, seqIMU++, true);
+  bool queued = link_enqueue_bin(0x101, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(ACC_FILE, pkt, (uint16_t)n);
   }
+} else if (m.k==K_GPS){
+  n = ccsds_pack(pkt, 0x100, (uint8_t*)&m.u.gps, sizeof(GPSrec), m.sec, m.ms, seqGPS++, true);
+  bool queued = link_enqueue_bin(0x100, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(GPS_FILE, pkt, (uint16_t)n);
+  }
+} else if (m.k==K_SEN1){
+  n = ccsds_pack(pkt, SENSOR1_APID, (uint8_t*)&m.u.sen, sizeof(SENrec), m.sec, m.ms, seqSEN1++, true);
+  bool queued = link_enqueue_bin(SENSOR1_APID, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(SENS1_FILE, pkt, (uint16_t)n);
+  }
+} else if (m.k==K_SEN2){
+  n = ccsds_pack(pkt, SENSOR2_APID, (uint8_t*)&m.u.sen, sizeof(SENrec), m.sec, m.ms, seqSEN2++, true);
+  bool queued = link_enqueue_bin(SENSOR2_APID, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(SENS2_FILE, pkt, (uint16_t)n);
+  }
+} else if (m.k==K_SEN3){
+  n = ccsds_pack(pkt, SENSOR3_APID, (uint8_t*)&m.u.sen, sizeof(SENrec), m.sec, m.ms, seqSEN3++, true);
+  bool queued = link_enqueue_bin(SENSOR3_APID, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(SENS3_FILE, pkt, (uint16_t)n);
+  }
+}
+}
 }
 
 // --- void logger_clear_all() ---
 void logger_clear_all(){
   vfs_clear(ACC_FILE);
   vfs_clear(GPS_FILE);
-  seqIMU=0; seqGPS=0;
+  vfs_clear(SENS1_FILE);
+  vfs_clear(SENS2_FILE);
+  vfs_clear(SENS3_FILE);
+  seqIMU=0; seqGPS=0; seqSEN1=0; seqSEN2=0; seqSEN3=0;
   if (q) xQueueReset(q);
 }
 
@@ -53,6 +103,38 @@ static inline void read_exact(uint32_t addr, void* dst, size_t n){
 
 // Helpers to compute CRC over header+payload during dump
 static inline uint16_t be16toh_u8(const uint8_t hi, const uint8_t lo){ return (uint16_t(hi)<<8) | lo; }
+
+void logger_dump_csv_sen(Stream& out, size_t max){
+  uint32_t rd; vfs_first(SENS1_FILE, rd);
+  const uint32_t end = SENS1_FILE.limit; size_t count=0;
+  out.println("apid,time,seq,addr,value,crc");
+  while (true){
+    uint16_t L; if (!vfs_next(SENS1_FILE, rd, L)) break; if (rd + L > end) break;
+
+    uint8_t hdr[12]; w25q_read(rd, hdr, 12); rd += 12;
+    uint16_t apid = ((uint16_t)hdr[0]<<8 | hdr[1]) & 0x07FF;
+    if (apid != 0x110) { rd += (L - 12); continue; }
+
+    uint16_t seq=(hdr[2]<<8)|hdr[3];
+    uint32_t sec=((uint32_t)hdr[6]<<24)|((uint32_t)hdr[7]<<16)|((uint32_t)hdr[8]<<8)|hdr[9];
+    uint16_t ms=(hdr[10]<<8)|hdr[11];
+
+    SENrec r; w25q_read(rd, (uint8_t*)&r, sizeof(r)); rd += sizeof(r);
+    uint8_t crcbe[2]; w25q_read(rd, crcbe, 2); rd += 2;
+    uint16_t crc_stored = (uint16_t(crcbe[0])<<8) | crcbe[1];
+
+    uint16_t crc_calc = crc16_ccitt(hdr, 12);
+    crc_calc = crc16_ccitt(reinterpret_cast<const uint8_t*>(&r), sizeof(r), crc_calc);
+    bool ok = (crc_calc == crc_stored);
+
+    out.printf("272,%lu.%03u,%u,0x%02X,%.3f,%s\n",  // 0x110 = 272 decimal
+               (unsigned long)sec, (unsigned)ms, (unsigned)(seq & 0x3FFF),
+               (unsigned)r.addr, r.value, ok ? "OK" : "ERR");
+
+    if (++count==max && max) break;
+    if (rd >= end) break;
+  }
+}
 
 // --- void logger_dump_csv_imu(Stream& out, size_t max) ---
 void logger_dump_csv_imu(Stream& out, size_t max){
@@ -223,3 +305,32 @@ static void dump_hex_region(Stream& out, const Region& R, size_t max){
 
 void logger_dump_hex_imu(Stream& out, size_t max){ dump_hex_region(out, ACC_FILE, max); }
 void logger_dump_hex_gps(Stream& out, size_t max){ dump_hex_region(out, GPS_FILE, max); }
+
+void logger_dump_csv_sen_common(Stream& out, const Region& R){
+  uint32_t rd; vfs_first(R, rd);
+  const uint32_t end = R.limit;
+  out.println("apid,time,seq,addr,value,crc");
+  while (true){
+    uint16_t L; if (!vfs_next(R, rd, L)) break; if (rd + L > end) break;
+    uint8_t hdr[12]; w25q_read(rd, hdr, 12); rd += 12;
+    uint16_t pid = (uint16_t(hdr[0])<<8)|hdr[1];
+    uint16_t apid = pid & 0x07FF;
+    uint16_t seq  = (hdr[2]<<8)|hdr[3];
+    uint32_t sec  = (uint32_t(hdr[6])<<24)|((uint32_t)hdr[7]<<16)|((uint32_t)hdr[8]<<8)|hdr[9];
+    uint16_t ms   = (hdr[10]<<8)|hdr[11];
+    SENrec r; w25q_read(rd, (uint8_t*)&r, sizeof(r)); rd += sizeof(r);
+    uint8_t crcbe[2]; w25q_read(rd, crcbe, 2); rd += 2;
+    uint16_t crc_stored = (uint16_t(crcbe[0])<<8)|crcbe[1];
+    uint16_t crc_calc = crc16_ccitt(hdr, 12);
+    crc_calc = crc16_ccitt(reinterpret_cast<const uint8_t*>(&r), sizeof(r), crc_calc);
+    bool ok = (crc_calc == crc_stored);
+    out.printf("%u,%lu.%03u,%u,0x%02X,%.3f,%s\n",
+      (unsigned)apid, (unsigned long)sec, (unsigned)ms, (unsigned)(seq&0x3FFF),
+      (unsigned)r.addr, r.value, ok? "OK":"ERR");
+    if (rd >= end) break;
+  }
+}
+
+void logger_dump_csv_sen1(Stream& out, size_t max){ (void)max; logger_dump_csv_sen_common(out, SENS1_FILE); }
+void logger_dump_csv_sen2(Stream& out, size_t max){ (void)max; logger_dump_csv_sen_common(out, SENS2_FILE); }
+void logger_dump_csv_sen3(Stream& out, size_t max){ (void)max; logger_dump_csv_sen_common(out, SENS3_FILE); }
