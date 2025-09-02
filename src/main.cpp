@@ -1,9 +1,3 @@
-/*
-================================================================================
- Project: Heltec ESP32-S3 Logger (GPS + IMU + OLED) + 3x I2C sensors
- Mode   : FreeRTOS (producers/consumers) + CCSDS + raw NOR VFS (no Wi-Fi)
-================================================================================
-*/
 #include <Arduino.h>
 #include <Wire.h>
 #include <HardwareSerial.h>
@@ -17,19 +11,23 @@
 #include "logger_vfs.h"
 #include "oled_ui.h"
 #include "tasks_cfg.h"
+#include "sens_common.h"   // declares extern I2C_MPU, I2C_MPU_MTX
 
-// ---- Global instances used by tasks (declared extern in tasks_cfg.cpp)
+// Global instances used by tasks
 Adafruit_MPU6050 mpu;
-TwoWire I2C_MPU(1);          // shared bus for MPU + I2C link sensors on pins 45/46
+TwoWire I2C_MPU(1);          // shared I2C bus (MPU + link sensors)
 HardwareSerial GPSSerial(1);
 TinyGPSPlus gps;
 
-// ---- Local helpers ----------------------------------------------------------
+// Define the global I2C mutex (single definition lives here)
+SemaphoreHandle_t I2C_MPU_MTX = nullptr;
 
 static void imu_init_or_die() {
-  // 100 kHz for reliability with ESP32 I2C-slave peers on same bus
-  I2C_MPU.begin(MPU_SDA, MPU_SCL, 100000);
+  // Keep your existing speed; if your slaves are ESP32-based, 50 kHz is safest.
+  I2C_MPU.begin(MPU_SDA, MPU_SCL, 50000);  // or 100000 if you prefer
+  I2C_MPU.setTimeOut(50); // ms
   delay(50);
+
   Serial.println("[imu] mpu.begin on I2C_MPU");
   if (!mpu.begin(0x68, &I2C_MPU)) {
     Serial.println("❌ MPU6050 not found");
@@ -45,12 +43,10 @@ static void gps_init_start() {
   GPSSerial.begin(9600, SERIAL_8N1, GPS_RX, GPS_TX);
 }
 
-// ---- Arduino lifecycle ------------------------------------------------------
-
 void setup() {
   Serial.begin(115200);
   delay(300);
-  Serial.println("\n🔧 Logger (RTOS + CCSDS + raw VFS + OLED + 3x I2C sensors)");
+  Serial.println("\n🔧 Logger (RTOS + I2C mutex)");
 
   // Power external rail first (OLED + external flash)
   oled_power_on();
@@ -64,12 +60,6 @@ void setup() {
 
   // VFS: scan regions & set write pointers
   vfs_init(false);
-  // If your vfs_init() leaves new regions at 0, clamp to base:
-  if (GPS_FILE.wptr   == 0) GPS_FILE.wptr   = GPS_FILE.base;
-  if (ACC_FILE.wptr   == 0) ACC_FILE.wptr   = ACC_FILE.base;
-  if (SENS1_FILE.wptr == 0) SENS1_FILE.wptr = SENS1_FILE.base;
-  if (SENS2_FILE.wptr == 0) SENS2_FILE.wptr = SENS2_FILE.base;
-  if (SENS3_FILE.wptr == 0) SENS3_FILE.wptr = SENS3_FILE.base;
 
   // Logger queue
   logger_begin();
@@ -80,14 +70,16 @@ void setup() {
   imu_init_or_die();
   gps_init_start();
 
-  // Start FreeRTOS producers/consumers (IMU/GPS/SEN1/SEN2/SEN3 + Flash + OLED)
+  // Create the shared I2C mutex now that the bus is up
+  I2C_MPU_MTX = xSemaphoreCreateMutex();
+
+  // Start FreeRTOS tasks
   tasks_start();
 
-  Serial.println("✅ RTOS started. Serial keys still work via dumps in logger_vfs.");
-  Serial.println("   I(imu CSV)  G(gps CSV)  1/2/3(sensor CSV)  C(clear)  P/p(headers)  X/x(hex)");
+  Serial.println("✅ RTOS started. Keys: I/G/1/2/3 etc.");
 }
 
 void loop() {
-  // All work happens in tasks now.
+  // All work happens in tasks
   vTaskDelay(1);
 }

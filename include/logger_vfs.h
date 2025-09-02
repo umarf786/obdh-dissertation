@@ -31,3 +31,13 @@ void logger_dump_hdrs_imu(Stream& out, size_t max=0);
 void logger_dump_hdrs_gps(Stream& out, size_t max=0);
 void logger_dump_hex_imu(Stream& out, size_t max=0);
 void logger_dump_hex_gps(Stream& out, size_t max=0);
+
+// --- Link hook API: implemented by mqtt_hex_streamer.cpp
+#ifdef __cplusplus
+extern "C" {
+#endif
+bool link_enqueue_bin(uint16_t apid, const uint8_t* pkt, uint16_t len); // returns true if queued
+bool link_is_ready(void);                                               // Wi-Fi+MQTT up
+#ifdef __cplusplus
+}
+#endif

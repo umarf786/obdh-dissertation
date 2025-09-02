@@ -4,6 +4,13 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 
+extern "C" __attribute__((weak))
+bool link_enqueue_bin(uint16_t, const uint8_t*, uint16_t) { return false; }
+
+extern "C" __attribute__((weak))
+bool link_is_ready(void) { return false; }
+
+
 #define SENSOR1_APID 0x110
 #define SENSOR2_APID 0x111
 #define SENSOR3_APID 0x112
@@ -46,19 +53,34 @@ void logger_flush_some(){
     uint8_t pkt[200]; size_t n=0;
     if (m.k==K_IMU){
   n = ccsds_pack(pkt, 0x101, (uint8_t*)&m.u.imu, sizeof(IMUrec), m.sec, m.ms, seqIMU++, true);
-  vfs_append_packet(ACC_FILE, pkt, (uint16_t)n);
+  bool queued = link_enqueue_bin(0x101, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(ACC_FILE, pkt, (uint16_t)n);
+  }
 } else if (m.k==K_GPS){
   n = ccsds_pack(pkt, 0x100, (uint8_t*)&m.u.gps, sizeof(GPSrec), m.sec, m.ms, seqGPS++, true);
-  vfs_append_packet(GPS_FILE, pkt, (uint16_t)n);
+  bool queued = link_enqueue_bin(0x100, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(GPS_FILE, pkt, (uint16_t)n);
+  }
 } else if (m.k==K_SEN1){
   n = ccsds_pack(pkt, SENSOR1_APID, (uint8_t*)&m.u.sen, sizeof(SENrec), m.sec, m.ms, seqSEN1++, true);
-  vfs_append_packet(SENS1_FILE, pkt, (uint16_t)n);
+  bool queued = link_enqueue_bin(SENSOR1_APID, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(SENS1_FILE, pkt, (uint16_t)n);
+  }
 } else if (m.k==K_SEN2){
   n = ccsds_pack(pkt, SENSOR2_APID, (uint8_t*)&m.u.sen, sizeof(SENrec), m.sec, m.ms, seqSEN2++, true);
-  vfs_append_packet(SENS2_FILE, pkt, (uint16_t)n);
+  bool queued = link_enqueue_bin(SENSOR2_APID, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(SENS2_FILE, pkt, (uint16_t)n);
+  }
 } else if (m.k==K_SEN3){
   n = ccsds_pack(pkt, SENSOR3_APID, (uint8_t*)&m.u.sen, sizeof(SENrec), m.sec, m.ms, seqSEN3++, true);
-  vfs_append_packet(SENS3_FILE, pkt, (uint16_t)n);
+  bool queued = link_enqueue_bin(SENSOR3_APID, pkt, (uint16_t)n);
+  if (!queued || !link_is_ready()) {
+    vfs_append_packet(SENS3_FILE, pkt, (uint16_t)n);
+  }
 }
 }
 }

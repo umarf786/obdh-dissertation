@@ -1,3 +1,4 @@
 {
-    "cmake.sourceDirectory": "C:/Users/umarf/Documents/PlatformIO/Projects/250819-120517-heltec_wifi_kit_32_V3/lib/Heltec_ESP32-2.1.4"
+    "cmake.sourceDirectory": "C:/Users/umarf/Documents/PlatformIO/Projects/250819-120517-heltec_wifi_kit_32_V3/lib/Heltec_ESP32-2.1.4",
+    "C_Cpp.errorSquiggles": "disabled"
 }

@@ -8,41 +8,60 @@
 #include <TinyGPSPlus.h>
 #include <Adafruit_MPU6050.h>
 #include "sens_common.h"   // LinkPacket + read_link_packet()
-#include "sens1.h"
-#include "sens2.h"
-#include "sens3.h"
 
+// ---- Global objects provided by main.cpp ----
 extern Adafruit_MPU6050 mpu;
 extern TwoWire I2C_MPU;
 extern TinyGPSPlus gps;
 extern HardwareSerial GPSSerial;
+extern "C" void link_task(void*);  // HEX-over-MQTT publisher
 
-QueueHandle_t qIMU=nullptr, qGPS=nullptr, qSEN1=nullptr, qSEN2=nullptr, qSEN3=nullptr;
 
-// ====== Producers ======
+// ---- Queues (defined here, declared extern in tasks_cfg.h) ----
+QueueHandle_t qIMU  = nullptr;
+QueueHandle_t qGPS  = nullptr;
+QueueHandle_t qSEN1 = nullptr;
+QueueHandle_t qSEN2 = nullptr;
+QueueHandle_t qSEN3 = nullptr;
+
+// ---- I2C mutex (defined in main.cpp) ----
+extern SemaphoreHandle_t I2C_MPU_MTX;
+
+// ====== Producers ==============================================================
 
 static void taskIMU(void*) {
-  sensors_event_t a,g,t;
-  for(;;){
-    mpu.getEvent(&a,&g,&t);
-    IMUrec ip{ a.acceleration.x, a.acceleration.y, a.acceleration.z,
-               g.gyro.x, g.gyro.y, g.gyro.z, t.temperature };
-    MsgT<IMUrec> m{ millis()/1000, (uint16_t)(millis()%1000), ip };
-    if (qIMU) xQueueSend(qIMU, &m, 0);
+  sensors_event_t a, g, t;
+  for (;;) {
+    // Guard I2C read of the MPU
+    if (xSemaphoreTake(I2C_MPU_MTX, pdMS_TO_TICKS(50)) == pdTRUE) {
+      mpu.getEvent(&a, &g, &t);
+      xSemaphoreGive(I2C_MPU_MTX);
+
+      IMUrec ip {
+        a.acceleration.x, a.acceleration.y, a.acceleration.z,
+        g.gyro.x,         g.gyro.y,         g.gyro.z,
+        t.temperature
+      };
+      MsgT<IMUrec> m { millis()/1000, (uint16_t)(millis()%1000), ip };
+      if (qIMU) xQueueSend(qIMU, &m, 0);
+    }
     vTaskDelay(pdMS_TO_TICKS(100)); // 10 Hz
   }
 }
 
 static void taskGPS(void*) {
-  uint32_t last=0;
-  for(;;){
+  uint32_t last = 0;
+  for (;;) {
     while (GPSSerial.available()) gps.encode(GPSSerial.read());
-    if (millis()-last >= 1000 && gps.location.isValid()){
-      GPSrec gp{ gps.location.lat(), gps.location.lng(),
-                 (float)gps.altitude.meters(),
-                 gps.hdop.isValid()? (float)gps.hdop.hdop() : NAN,
-                 (uint8_t)gps.satellites.value() };
-      MsgT<GPSrec> m{ millis()/1000, (uint16_t)(millis()%1000), gp };
+    if (millis() - last >= 1000 && gps.location.isValid()) {
+      GPSrec gp {
+        gps.location.lat(),
+        gps.location.lng(),
+        (float)gps.altitude.meters(),
+        gps.hdop.isValid() ? (float)gps.hdop.hdop() : NAN,
+        (uint8_t)gps.satellites.value()
+      };
+      MsgT<GPSrec> m { millis()/1000, (uint16_t)(millis()%1000), gp };
       if (qGPS) xQueueSend(qGPS, &m, 0);
       last = millis();
     }
@@ -50,77 +69,64 @@ static void taskGPS(void*) {
   }
 }
 
-// Link pollers: one per sensor (5 Hz)
-static void taskSEN1(void*) {
-  for(;;){
+// One task polls 0x20/0x21/0x22 sequentially, avoiding I2C contention
+static void taskSENSORS(void*) {
+  for (;;) {
+    uint32_t now = millis();
+    uint32_t sec = now/1000; uint16_t ms = (uint16_t)(now%1000);
     LinkPacket p{};
-    if (read_link_packet(0x20, p)){
-      SENrec r{0x20, p.value};
-      MsgT<SENrec> m{ millis()/1000, (uint16_t)(millis()%1000), r };
-      if (qSEN1) xQueueSend(qSEN1, &m, 0);
+
+    if (read_link_packet(0x20, p)) {
+      SENrec r{ 0x20, p.value };
+      MsgT<SENrec> m { sec, ms, r }; if (qSEN1) xQueueSend(qSEN1, &m, 0);
     }
-    vTaskDelay(pdMS_TO_TICKS(200));
-  }
-}
-static void taskSEN2(void*) {
-  for(;;){
-    LinkPacket p{};
-    if (read_link_packet(0x21, p)){
-      SENrec r{0x21, p.value};
-      MsgT<SENrec> m{ millis()/1000, (uint16_t)(millis()%1000), r };
-      if (qSEN2) xQueueSend(qSEN2, &m, 0);
+    if (read_link_packet(0x21, p)) {
+      SENrec r{ 0x21, p.value };
+      MsgT<SENrec> m { sec, ms, r }; if (qSEN2) xQueueSend(qSEN2, &m, 0);
     }
-    vTaskDelay(pdMS_TO_TICKS(200));
-  }
-}
-static void taskSEN3(void*) {
-  for(;;){
-    LinkPacket p{};
-    if (read_link_packet(0x22, p)){
-      SENrec r{0x22, p.value};
-      MsgT<SENrec> m{ millis()/1000, (uint16_t)(millis()%1000), r };
-      if (qSEN3) xQueueSend(qSEN3, &m, 0);
+    if (read_link_packet(0x22, p)) {
+      SENrec r{ 0x22, p.value };
+      MsgT<SENrec> m { sec, ms, r }; if (qSEN3) xQueueSend(qSEN3, &m, 0);
     }
-    vTaskDelay(pdMS_TO_TICKS(200));
+
+    vTaskDelay(pdMS_TO_TICKS(200)); // ~5 Hz round-robin
   }
 }
 
-// ====== Consumers ======
-// 1) Flash packer (takes from all queues and calls logger_*)
-// 2) OLED refresher (lightweight)
+// ====== Consumers ==============================================================
 
 static void taskFlash(void*) {
-  // Pull from the per-sensor queues and feed existing logger_* APIs.
-  // This keeps CCSDS/VFS unchanged.
-  const TickType_t tout = pdMS_TO_TICKS(5);
-  for(;;){
+  for (;;) {
     MsgT<IMUrec>  mi;
     MsgT<GPSrec>  mg;
     MsgT<SENrec>  s1, s2, s3;
 
-    if (qIMU  && xQueueReceive(qIMU, &mi, 0)==pdTRUE) logger_logIMU(mi.payload, mi.sec, mi.ms);
-    if (qGPS  && xQueueReceive(qGPS, &mg, 0)==pdTRUE) logger_logGPS(mg.payload, mg.sec, mg.ms);
-    if (qSEN1 && xQueueReceive(qSEN1,&s1, 0)==pdTRUE) logger_logSEN1(s1.payload, s1.sec, s1.ms);
-    if (qSEN2 && xQueueReceive(qSEN2,&s2, 0)==pdTRUE) logger_logSEN2(s2.payload, s2.sec, s2.ms);
-    if (qSEN3 && xQueueReceive(qSEN3,&s3, 0)==pdTRUE) logger_logSEN3(s3.payload, s3.sec, s3.ms);
+    if (qIMU  && xQueueReceive(qIMU,  &mi,  0) == pdTRUE) logger_logIMU (mi.payload, mi.sec, mi.ms);
+    if (qGPS  && xQueueReceive(qGPS,  &mg,  0) == pdTRUE) logger_logGPS (mg.payload, mg.sec, mg.ms);
+    if (qSEN1 && xQueueReceive(qSEN1, &s1,  0) == pdTRUE) logger_logSEN1(s1.payload, s1.sec, s1.ms);
+    if (qSEN2 && xQueueReceive(qSEN2, &s2,  0) == pdTRUE) logger_logSEN2(s2.payload, s2.sec, s2.ms);
+    if (qSEN3 && xQueueReceive(qSEN3, &s3,  0) == pdTRUE) logger_logSEN3(s3.payload, s3.sec, s3.ms);
 
-    // Write a few packets per round
     logger_flush_some();
-    vTaskDelay(tout);
+    vTaskDelay(pdMS_TO_TICKS(5));
   }
 }
 
 static void taskOLED(void*) {
-  sensors_event_t a,g,t;
-  for(;;){
-    // Quick IMU sample for UI only (doesn't need to match pack cadence)
-    mpu.getEvent(&a,&g,&t);
-    drawOLED(a,g,t,gps);
-    vTaskDelay(pdMS_TO_TICKS(150));
+  for (;;) {
+    // If drawOLED needs fresh IMU data, guard the read here too.
+    sensors_event_t a{}, g{}, t{};
+    if (xSemaphoreTake(I2C_MPU_MTX, pdMS_TO_TICKS(50)) == pdTRUE) {
+      mpu.getEvent(&a, &g, &t);
+      xSemaphoreGive(I2C_MPU_MTX);
+    }
+    drawOLED(a, g, t, gps);   // your existing OLED renderer
+    vTaskDelay(pdMS_TO_TICKS(150)); // ~6–7 FPS
   }
 }
 
-// ====== Serial console task (non-blocking) ======
+// ====== Serial console (unchanged) ===========================================
+
 static void taskConsole(void*) {
   for (;;) {
     while (Serial.available()) {
@@ -140,23 +146,27 @@ static void taskConsole(void*) {
   }
 }
 
+// ====== Bootstrap =============================================================
 
-void tasks_start(){
-  // Queues sized for a few seconds of backlog each
+void tasks_start() {
+  // Create queues (sizes as you had them)
   qIMU  = xQueueCreate(128, sizeof(MsgT<IMUrec>));
   qGPS  = xQueueCreate(64,  sizeof(MsgT<GPSrec>));
   qSEN1 = xQueueCreate(64,  sizeof(MsgT<SENrec>));
   qSEN2 = xQueueCreate(64,  sizeof(MsgT<SENrec>));
   qSEN3 = xQueueCreate(64,  sizeof(MsgT<SENrec>));
 
-  // Pin critical producers to a core
-  xTaskCreatePinnedToCore(taskIMU,  "tIMU",  4096, nullptr, 3, nullptr, APP_CPU_NUM);
-  xTaskCreatePinnedToCore(taskGPS,  "tGPS",  4096, nullptr, 3, nullptr, APP_CPU_NUM);
-  xTaskCreatePinnedToCore(taskSEN1, "tS1",   3072, nullptr, 2, nullptr, APP_CPU_NUM);
-  xTaskCreatePinnedToCore(taskSEN2, "tS2",   3072, nullptr, 2, nullptr, APP_CPU_NUM);
-  xTaskCreatePinnedToCore(taskSEN3, "tS3",   3072, nullptr, 2, nullptr, APP_CPU_NUM);
+  // I2C mutex is created in main.cpp after I2C_MPU.begin()
 
-  xTaskCreatePinnedToCore(taskFlash,"tFlash",4096, nullptr, 2, nullptr, PRO_CPU_NUM);
-  xTaskCreatePinnedToCore(taskOLED, "tOLED", 3072, nullptr, 1, nullptr, PRO_CPU_NUM);
-  xTaskCreatePinnedToCore(taskConsole, "tCON", 4096, nullptr, 1, nullptr, PRO_CPU_NUM);
+  // Pin sampling to APP core, consumers/UI to PRO core (as you had)
+  xTaskCreatePinnedToCore(taskIMU,     "tIMU",     4096, nullptr, 3, nullptr, APP_CPU_NUM);
+  xTaskCreatePinnedToCore(taskGPS,     "tGPS",     4096, nullptr, 3, nullptr, APP_CPU_NUM);
+  xTaskCreatePinnedToCore(taskSENSORS, "tSENS",    3072, nullptr, 2, nullptr, APP_CPU_NUM);
+
+  xTaskCreatePinnedToCore(taskFlash,   "tFLASH",   4096, nullptr, 1, nullptr, PRO_CPU_NUM);
+  xTaskCreatePinnedToCore(taskOLED,    "tOLED",    3072, nullptr, 1, nullptr, PRO_CPU_NUM);
+  xTaskCreatePinnedToCore(taskConsole, "tCONSOLE", 4096, nullptr, 1, nullptr, PRO_CPU_NUM);
+
+  // NEW: link publisher (PRO core, low prio)
+  xTaskCreatePinnedToCore(link_task,   "tLINK",    6144, nullptr, 3, nullptr, PRO_CPU_NUM);
 }
